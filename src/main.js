@@ -1,5 +1,22 @@
 const { invoke } = window.__TAURI__.core;
 
+// 图片数据缓存
+const imageDataCache = new Map();
+
+// 清理图片缓存
+function clearImageCache() {
+    // 释放所有 Blob URLs
+    for (const blobUrl of imageDataCache.values()) {
+        URL.revokeObjectURL(blobUrl);
+    }
+    imageDataCache.clear();
+
+    // 通知后端清理缓存
+    invoke('clear_image_cache').catch(err => {
+        console.warn('清理后端缓存失败:', err);
+    });
+}
+
 // --- 元素获取 ---
 let homeBtn, folderBtn, settingsBtn, layoutToggleBtn;
 let selectFolderBtn;
@@ -12,16 +29,17 @@ let sortSelect, hideThumbnailsCheckbox;
 
 // --- 状态管理 ---
 let currentRootDir = null;
-let allImagePaths = [];
-let filteredImagePaths = [];
 let currentImageIndex = 0;
 let columnElements = [];
 let sentinelObserver = null;
 let isLoading = false;
-let currentLayout = 'waterfall'; // 'waterfall' 或 'grid'
+let currentLayout = 'grid'; // 'waterfall' 或 'grid'
 let currentSortOrder = 'time-desc';
 let hideThumbnails = false;
-const BATCH_SIZE = 10;
+let currentPage = 0;
+let hasMoreImages = true;
+let totalImages = 0;
+const PAGE_SIZE = 20;
 
 // --- 工具函数 ---
 function debounce(func, delay) {
@@ -166,68 +184,89 @@ function updateBreadcrumb(path) {
 async function startImageLoading(folderPath) {
     try {
         // 重置状态
-        allImagePaths = [];
-        filteredImagePaths = [];
         currentImageIndex = 0;
+        currentPage = 0;
+        hasMoreImages = true;
+        totalImages = 0;
         imageGallery.innerHTML = '';
         columnElements = [];
 
-        // 获取图片列表（现在返回的是 ImageInfo 对象数组）
-        allImagePaths = await invoke('get_images_in_folder', { folderPath });
+        // 清除图片缓存
+        clearImageCache();
 
-        if (allImagePaths.length === 0) {
-            imageGallery.innerHTML = '<p style="text-align:center;padding:20px;">该文件夹中没有图片</p>';
-            return;
-        }
-
-        // 应用筛选和排序
-        applyFilterAndSort();
-
-        if (filteredImagePaths.length === 0) {
-            imageGallery.innerHTML = '<p style="text-align:center;padding:20px;">没有符合条件的图片</p>';
-            return;
+        if (scrollContainer) {
+            scrollContainer.scrollTop = 0;
         }
 
         // 设置布局
         setupLayout();
 
         // 加载初始图片
-        loadInitialImages();
+        await loadMoreImages(folderPath);
+
+        // 检查是否需要继续加载以填满视口
+        await ensureViewportFilled(folderPath);
     } catch (error) {
         console.error('加载图片失败:', error);
         imageGallery.innerHTML = '<p style="text-align:center;padding:20px;color:red;">加载失败: ' + error + '</p>';
     }
 }
 
-// --- 应用筛选和排序 ---
-function applyFilterAndSort() {
-    // 筛选
-    filteredImagePaths = allImagePaths.filter(img => {
-        if (hideThumbnails && img.is_thumbnail) {
-            return false;
-        }
-        return true;
-    });
+// 加载图片的 Blob URL
+async function loadImageBlob(imageId, mimeType = 'image/jpeg') {
+    // 检查缓存
+    if (imageDataCache.has(imageId)) {
+        return imageDataCache.get(imageId);
+    }
 
-    // 排序
-    filteredImagePaths.sort((a, b) => {
-        switch (currentSortOrder) {
-            case 'name-asc':
-                return a.name.localeCompare(b.name);
-            case 'name-desc':
-                return b.name.localeCompare(a.name);
-            case 'time-asc':
-                return a.modified - b.modified;
-            case 'time-desc':
-                return b.modified - a.modified;
-            case 'size-asc':
-                return a.size - b.size;
-            case 'size-desc':
-                return b.size - a.size;
-            default:
-                return 0;
-        }
-    });
+    try {
+        // 从后端获取图片二进制数据
+        const imageData = await invoke('get_image_data', { imageId });
+
+        // 创建 Blob 和 URL
+        const blob = new Blob([new Uint8Array(imageData)], { type: mimeType || 'image/jpeg' });
+        const blobUrl = URL.createObjectURL(blob);
+
+        // 缓存 URL
+        imageDataCache.set(imageId, blobUrl);
+
+        return blobUrl;
+    } catch (error) {
+        console.error('加载图片失败:', imageId, error);
+        return null;
+    }
+}
+
+// 确保视口被填满
+async function ensureViewportFilled(folderPath) {
+    if (!hasMoreImages || isLoading) return;
+
+    // 等待DOM更新和图片渲染
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // 检查是否需要加载更多
+    const needsMore = checkIfNeedsMoreContent();
+
+    if (needsMore && hasMoreImages) {
+        await loadMoreImages(folderPath);
+        // 递归检查，直到填满或没有更多图片
+        await ensureViewportFilled(folderPath);
+    }
+}
+
+// 检查是否需要更多内容来填充视口
+function checkIfNeedsMoreContent() {
+    if (!scrollContainer) return false;
+
+    if (currentLayout === 'grid') {
+        // Grid模式：检查画廊高度是否小于容器高度
+        return imageGallery.scrollHeight <= scrollContainer.clientHeight + 100;
+    } else {
+        // 瀑布流模式：检查最短列是否足够高
+        if (columnElements.length === 0) return false;
+        const shortestColumn = getShortestColumn();
+        return shortestColumn.offsetHeight <= scrollContainer.clientHeight;
+    }
 }
 
 function setupLayout() {
@@ -237,7 +276,6 @@ function setupLayout() {
     if (currentLayout === 'grid') {
         // 网格布局
         imageGallery.classList.add('grid-layout');
-        // 在网格布局中，不需要创建列，直接使用 grid
     } else {
         // 瀑布流布局
         imageGallery.classList.remove('grid-layout');
@@ -262,60 +300,91 @@ function setupSentinel() {
         sentinelObserver.disconnect();
     }
 
+    const existingSentinel = scrollContainer.querySelector('#sentinel');
+    if (existingSentinel) {
+        existingSentinel.remove();
+    }
+
     const sentinel = document.createElement('div');
     sentinel.id = 'sentinel';
     sentinel.style.height = '1px';
     scrollContainer.appendChild(sentinel);
 
     sentinelObserver = new IntersectionObserver((entries) => {
-        if (entries[0].isIntersecting && !isLoading) {
-            loadMoreImages();
+        if (entries[0].isIntersecting && !isLoading && hasMoreImages) {
+            const folderPath = breadcrumb.querySelector('fluent-breadcrumb-item:last-child')?.dataset.path;
+            if (folderPath) {
+                loadMoreImages(folderPath);
+            }
         }
-    }, { root: scrollContainer, threshold: 0.1 });
+    }, {
+        root: scrollContainer,
+        rootMargin: '500px',  // 提前500px开始加载
+        threshold: 0.1
+    });
 
     sentinelObserver.observe(sentinel);
 }
 
-function loadInitialImages() {
-    const viewportHeight = scrollContainer.offsetHeight;
+function handleScrollLoad() {
+    if (!scrollContainer || isLoading || !hasMoreImages) {
+        return;
+    }
 
-    if (currentLayout === 'grid') {
-        // 网格布局：计算需要填充视口的图片数量
-        const itemWidth = 200; // minmax(200px, 1fr)
-        const gap = 16;
-        const columns = Math.floor(imageGallery.offsetWidth / (itemWidth + gap));
-        const rows = Math.ceil(viewportHeight / (itemWidth + gap));
-        const estimatedImagesNeeded = columns * rows * 2; // 多加载一些
-
-        for (let i = 0; i < Math.min(estimatedImagesNeeded, filteredImagePaths.length); i++) {
-            addImageToGallery();
-        }
-    } else {
-        // 瀑布流布局
-        const estimatedImagesNeeded = Math.ceil(viewportHeight / 200) * columnElements.length;
-
-        for (let i = 0; i < Math.min(estimatedImagesNeeded, filteredImagePaths.length); i++) {
-            const shortestColumn = getShortestColumn();
-            addImageToColumn(shortestColumn);
+    const remaining = scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+    if (remaining <= 300) {
+        const folderPath = breadcrumb.querySelector('fluent-breadcrumb-item:last-child')?.dataset.path;
+        if (folderPath) {
+            loadMoreImages(folderPath);
         }
     }
 }
 
-function loadMoreImages() {
-    if (isLoading || currentImageIndex >= filteredImagePaths.length) return;
+async function loadMoreImages(folderPath) {
+    if (isLoading || !hasMoreImages) return;
 
     isLoading = true;
 
-    for (let i = 0; i < BATCH_SIZE && currentImageIndex < filteredImagePaths.length; i++) {
-        if (currentLayout === 'grid') {
-            addImageToGallery();
-        } else {
-            const shortestColumn = getShortestColumn();
-            addImageToColumn(shortestColumn);
-        }
-    }
+    try {
+        // 解析排序参数
+        const [sortBy, sortOrder] = currentSortOrder.split('-');
 
-    isLoading = false;
+        // 调用后端批量获取接口
+        const batch = await invoke('get_images_batch', {
+            folderPath,
+            page: currentPage,
+            pageSize: PAGE_SIZE,
+            sortBy,
+            sortOrder,
+            hideThumbnails
+        });
+
+        totalImages = batch.total;
+        hasMoreImages = batch.has_more;
+        currentPage++;
+
+        if (batch.images.length === 0 && currentPage === 1) {
+            imageGallery.innerHTML = '<p style="text-align:center;padding:20px;">该文件夹中没有图片</p>';
+            return;
+        }
+
+        // 添加图片到界面
+        for (const imageData of batch.images) {
+            if (currentLayout === 'grid') {
+                addImageToGallery(imageData);
+            } else {
+                const shortestColumn = getShortestColumn();
+                addImageToColumn(shortestColumn, imageData);
+            }
+        }
+    } catch (error) {
+        console.error('加载图片失败:', error);
+        if (currentPage === 1) {
+            imageGallery.innerHTML = '<p style="text-align:center;padding:20px;color:red;">加载失败: ' + error + '</p>';
+        }
+    } finally {
+        isLoading = false;
+    }
 }
 
 function getShortestColumn() {
@@ -324,96 +393,58 @@ function getShortestColumn() {
     );
 }
 
-function addImageToGallery() {
-    // 用于网格布局：直接添加到 gallery
-    if (currentImageIndex >= filteredImagePaths.length) return;
-
-    const imageInfo = filteredImagePaths[currentImageIndex++];
-    const relPath = imageInfo.path;
-    const fileName = imageInfo.name;
-
+function addImageToGallery(imageData) {
     const card = document.createElement('fluent-card');
-    card.className = 'image-card is-loading';
-
-    const placeholder = document.createElement('div');
-    placeholder.className = 'image-placeholder';
-    placeholder.textContent = '加载中...';
+    card.className = 'image-card';
 
     const img = document.createElement('img');
-    img.alt = fileName;
-    img.style.display = 'none';
+    img.alt = imageData.name;
+    img.dataset.imageId = imageData.image_id;
+
+    // 使用占位符
+    img.src = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="200" height="200"%3E%3Crect fill="%23ddd" width="200" height="200"/%3E%3C/svg%3E';
+
+    // 异步加载图片
+    loadImageBlob(imageData.image_id, imageData.mime_type).then(blobUrl => {
+        if (blobUrl) {
+            img.src = blobUrl;
+        }
+    });
 
     const caption = document.createElement('div');
     caption.className = 'caption';
-    caption.textContent = fileName;
+    caption.textContent = imageData.name;
 
-    card.appendChild(placeholder);
     card.appendChild(img);
     card.appendChild(caption);
     imageGallery.appendChild(card);
-
-    // 异步加载图片
-    fetchAndSetImage(relPath, img, card, placeholder);
 }
 
-async function addImageToColumn(column) {
-    if (currentImageIndex >= filteredImagePaths.length) return;
-
-    const imageInfo = filteredImagePaths[currentImageIndex++];
-    const relPath = imageInfo.path;
-    const fileName = imageInfo.name;
-
+function addImageToColumn(column, imageData) {
     const card = document.createElement('fluent-card');
-    card.className = 'image-card is-loading';
-
-    const placeholder = document.createElement('div');
-    placeholder.className = 'image-placeholder';
-    placeholder.textContent = '加载中...';
+    card.className = 'image-card';
 
     const img = document.createElement('img');
-    img.alt = fileName;
-    img.style.display = 'none';
+    img.alt = imageData.name;
+    img.dataset.imageId = imageData.image_id;
+
+    // 使用占位符
+    img.src = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="200" height="200"%3E%3Crect fill="%23ddd" width="200" height="200"/%3E%3C/svg%3E';
+
+    // 异步加载图片
+    loadImageBlob(imageData.image_id, imageData.mime_type).then(blobUrl => {
+        if (blobUrl) {
+            img.src = blobUrl;
+        }
+    });
 
     const caption = document.createElement('div');
     caption.className = 'caption';
-    caption.textContent = fileName;
+    caption.textContent = imageData.name;
 
-    card.appendChild(placeholder);
     card.appendChild(img);
     card.appendChild(caption);
     column.appendChild(card);
-
-    // 异步加载图片
-    fetchAndSetImage(relPath, img, card, placeholder);
-}
-
-async function fetchAndSetImage(relPath, imgElement, card, placeholder) {
-    try {
-        const base64Data = await invoke('decrypt_dat_file', { filePath: relPath });
-
-        // 判断图片类型
-        let mimeType = 'image/jpeg';
-        if (base64Data.startsWith('/9j/')) mimeType = 'image/jpeg';
-        else if (base64Data.startsWith('iVBORw0KGgo')) mimeType = 'image/png';
-        else if (base64Data.startsWith('R0lGOD')) mimeType = 'image/gif';
-
-        imgElement.src = `data:${mimeType};base64,${base64Data}`;
-
-        imgElement.onload = () => {
-            card.classList.remove('is-loading');
-            imgElement.style.display = 'block';
-            placeholder.style.display = 'none';
-        };
-
-        imgElement.onerror = () => {
-            placeholder.textContent = '加载失败';
-            card.classList.remove('is-loading');
-        };
-    } catch (error) {
-        console.error('解密图片失败:', error);
-        placeholder.textContent = '解密失败';
-        card.classList.remove('is-loading');
-    }
 }
 
 // --- 设置管理 ---
@@ -511,12 +542,19 @@ window.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    scrollContainer.addEventListener('scroll', handleScrollLoad);
+
     window.addEventListener('resize', debounce(() => {
-        if (filteredImagePaths.length > 0 && !folderView.classList.contains('hidden')) {
+        if (currentRootDir && !folderView.classList.contains('hidden')) {
             const folderPath = breadcrumb.querySelector('fluent-breadcrumb-item:last-child')?.dataset.path;
             if (folderPath) startImageLoading(folderPath);
         }
     }, 250));
+
+    // 页面卸载时清理缓存
+    window.addEventListener('beforeunload', () => {
+        clearImageCache();
+    });
 
     // 初始视图
     switchView('home');
