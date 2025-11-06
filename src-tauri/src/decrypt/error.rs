@@ -1,23 +1,31 @@
 //! DAT 解密错误类型
 
-use thiserror::Error;
+use crate::error::AppError;
 
 /// DAT 解密错误类型
-#[derive(Error, Debug)]
+#[derive(Debug, Clone)]
 pub enum DecryptError {
-    #[error("文件读取失败: {0}")]
-    IoError(#[from] std::io::Error),
-
-    #[error("文件格式无效")]
-    #[allow(dead_code)] // 保留以供未来使用
+    IoError(String),
     InvalidFormat,
-
-    #[error("AES 解密失败: {0}")]
     AesDecryptError(String),
-
-    #[error("不支持的 DAT 版本")]
     UnsupportedVersion,
-
-    #[error("文件头解析失败")]
     HeaderParseError,
+}
+
+impl From<DecryptError> for AppError {
+    fn from(err: DecryptError) -> Self {
+        match err {
+            DecryptError::IoError(msg) => AppError::Internal(format!("文件读取失败: {}", msg)),
+            DecryptError::InvalidFormat => AppError::InvalidDatFormat,
+            DecryptError::AesDecryptError(msg) => AppError::AesDecryptError(msg),
+            DecryptError::UnsupportedVersion => AppError::UnsupportedDatVersion,
+            DecryptError::HeaderParseError => AppError::DatHeaderParseError,
+        }
+    }
+}
+
+impl From<std::io::Error> for DecryptError {
+    fn from(err: std::io::Error) -> Self {
+        DecryptError::IoError(err.to_string())
+    }
 }

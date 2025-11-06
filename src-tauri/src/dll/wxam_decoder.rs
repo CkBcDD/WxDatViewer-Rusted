@@ -2,13 +2,12 @@
 //!
 //! 该模块提供了将微信 WXAM 格式文件转换为标准图片格式(JPEG/GIF)的功能。
 
-use std::ffi::c_void;
+use crate::error::AppError;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use thiserror::Error;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::System::LibraryLoader::{FreeLibrary, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
 /// 支持的图片格式
 #[repr(i32)]
@@ -29,34 +28,6 @@ struct WxAMConfig {
     reserved: i32,
 }
 
-/// WXAM 解码错误类型
-#[derive(Error, Debug)]
-pub enum WxAMError {
-    #[error("DLL 文件不存在: {0}")]
-    DllNotFound(String),
-
-    #[error("DLL 加载失败: {0}")]
-    DllLoadFailed(String),
-
-    #[error("DLL 函数未正确初始化")]
-    FunctionNotInitialized,
-
-    #[error("输入数据不能为空")]
-    EmptyInput,
-
-    #[error("不支持的格式: {0:?}")]
-    UnsupportedFormat(i32),
-
-    #[error("DLL 解码失败,错误代码: {0}")]
-    DecodeFailed(i64),
-
-    #[error("解码结果大小无效")]
-    InvalidOutputSize,
-
-    #[error("解码过程异常: {0}")]
-    DecodeError(String),
-}
-
 /// DLL 函数指针类型
 type WxamDecFunction = unsafe extern "system" fn(
     input_addr: i64,
@@ -72,16 +43,16 @@ struct DllHolder {
     function: WxamDecFunction,
 }
 
-impl Drop for DllHolder {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = FreeLibrary(self._handle);
-        }
-    }
-}
+// 注意: 不显式释放 DLL，让系统在进程退出时自动清理
+// 在 Windows 上,DLL 会随着进程关闭而自动卸载
+
+// HMODULE 和函数指针在 Windows 上本质上是线程安全的
+// (它们本质上是内存地址)
+unsafe impl Send for DllHolder {}
+unsafe impl Sync for DllHolder {}
 
 // 全局 DLL 实例
-static DLL_INSTANCE: OnceLock<Result<DllHolder, String>> = OnceLock::new();
+static DLL_INSTANCE: OnceLock<Result<DllHolder, AppError>> = OnceLock::new();
 
 /// WXAM 格式解码器
 ///
@@ -96,15 +67,15 @@ impl WxAMDecoder {
     const DLL_NAME: &'static str = "VoipEngine.dll";
 
     /// 加载 VoipEngine.dll
-    fn load_dll() -> Result<&'static DllHolder, WxAMError> {
+    fn load_dll() -> Result<&'static DllHolder, AppError> {
         DLL_INSTANCE
-            .get_or_init(|| Self::load_dll_internal().map_err(|e| e.to_string()))
+            .get_or_init(|| Self::load_dll_internal())
             .as_ref()
-            .map_err(|e| WxAMError::DllLoadFailed(e.clone()))
+            .map_err(|e| e.clone())
     }
 
     /// 内部 DLL 加载实现
-    fn load_dll_internal() -> Result<DllHolder, WxAMError> {
+    fn load_dll_internal() -> Result<DllHolder, AppError> {
         // 获取 DLL 路径
         let dll_path = std::env::current_exe()
             .ok()
@@ -113,7 +84,7 @@ impl WxAMDecoder {
             .join(Self::DLL_NAME);
 
         if !dll_path.exists() {
-            return Err(WxAMError::DllNotFound(dll_path.display().to_string()));
+            return Err(AppError::DllNotFound(dll_path.display().to_string()));
         }
 
         // 转换为 UTF-16
@@ -126,7 +97,7 @@ impl WxAMDecoder {
         // 加载 DLL
         let handle = unsafe {
             LoadLibraryW(PCWSTR::from_raw(dll_path_wide.as_ptr()))
-                .map_err(|e| WxAMError::DllLoadFailed(format!("LoadLibrary 失败: {}", e)))?
+                .map_err(|e| AppError::DllLoadFailed(format!("LoadLibrary 失败: {}", e)))?
         };
 
         // 获取函数地址
@@ -137,7 +108,7 @@ impl WxAMDecoder {
                 windows::core::PCSTR::from_raw(func_name.as_ptr()),
             )
             .ok_or_else(|| {
-                WxAMError::DllLoadFailed("无法找到函数 wxam_dec_wxam2pic_5".to_string())
+                AppError::DllLoadFailed("无法找到函数 wxam_dec_wxam2pic_5".to_string())
             })?
         };
 
@@ -165,13 +136,13 @@ impl WxAMDecoder {
     /// # 错误
     ///
     /// 当参数验证失败或解码失败时返回错误
-    pub fn decode(data: &[u8], format: ImageFormat) -> Result<Vec<u8>, WxAMError> {
+    pub fn decode(data: &[u8], format: ImageFormat) -> Result<Vec<u8>, AppError> {
         // 验证 DLL 是否已加载
         let dll_holder = Self::load_dll()?;
 
         // 参数验证
         if data.is_empty() {
-            return Err(WxAMError::EmptyInput);
+            return Err(AppError::EmptyInput);
         }
 
         // 创建配置结构体
@@ -203,11 +174,11 @@ impl WxAMDecoder {
 
         // 检查返回值
         if result != 0 {
-            return Err(WxAMError::DecodeFailed(result));
+            return Err(AppError::DllDecodeFailed(result));
         }
 
         if output_size <= 0 {
-            return Err(WxAMError::InvalidOutputSize);
+            return Err(AppError::InvalidOutputSize);
         }
 
         // 截取有效数据
@@ -229,23 +200,16 @@ impl WxAMDecoder {
 /// # 返回
 ///
 /// 转换后的图片字节数据,失败时返回 None
-pub fn wxam_to_image(data: &[u8], format: &str) -> Option<Vec<u8>> {
+pub fn wxam_to_image(data: &[u8], format: &str) -> Result<Vec<u8>, AppError> {
     let image_format = match format.to_lowercase().as_str() {
         "jpeg" => ImageFormat::Jpeg,
         "gif" => ImageFormat::Gif,
         _ => {
-            log::error!("不支持的格式: {}", format);
-            return None;
+            return Err(AppError::UnsupportedImageFormat(format.to_string()));
         }
     };
 
-    match WxAMDecoder::decode(data, image_format) {
-        Ok(result) => Some(result),
-        Err(e) => {
-            log::error!("解码失败: {}", e);
-            None
-        }
-    }
+    WxAMDecoder::decode(data, image_format)
 }
 
 #[cfg(test)]
@@ -255,7 +219,7 @@ mod tests {
     #[test]
     fn test_empty_input() {
         let result = WxAMDecoder::decode(&[], ImageFormat::Jpeg);
-        assert!(matches!(result, Err(WxAMError::EmptyInput)));
+        assert!(matches!(result, Err(AppError::EmptyInput)));
     }
 
     #[test]

@@ -5,8 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::State;
 
+mod error;
+pub use error::{AppError, ErrorResponse};
+
 mod decrypt;
 use decrypt::DatDecryptor;
+
+#[cfg(windows)]
+pub mod dll;
 
 // 配置文件路径
 const CONFIG_FILE: &str = "config.json";
@@ -51,13 +57,14 @@ fn read_key_from_config() -> (u8, Vec<u8>) {
 }
 
 // 保存配置文件
-fn save_key_to_config(xor: u8, aes: &str) -> Result<(), String> {
+fn save_key_to_config(xor: u8, aes: &str) -> Result<(), AppError> {
     let config = Config {
         xor,
         aes: aes.to_string(),
     };
-    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    fs::write(CONFIG_FILE, json).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|e| AppError::ConfigSerializeError(e.to_string()))?;
+    fs::write(CONFIG_FILE, json).map_err(|e| AppError::FileWriteError(e.to_string()))?;
     Ok(())
 }
 
@@ -72,7 +79,9 @@ async fn open_folder_dialog(
     let folder = app.dialog().file().blocking_pick_folder();
 
     if let Some(path) = folder {
-        let path_buf = path.as_path().ok_or_else(|| "无效路径".to_string())?;
+        let path_buf = path
+            .as_path()
+            .ok_or(AppError::InvalidPath("对话框返回无效路径".to_string()))?;
         let path_str = path_buf.to_string_lossy().to_string();
 
         // 更新状态
@@ -85,7 +94,7 @@ async fn open_folder_dialog(
 
         Ok(path_str)
     } else {
-        Err("未选择文件夹".to_string())
+        Err(String::from(AppError::NoFolderSelected))
     }
 }
 
@@ -95,9 +104,10 @@ fn get_folder_tree(state: State<AppState>) -> Result<TreeNode, String> {
     let root_dir = state.root_dir.lock().unwrap();
     let root_path = root_dir
         .as_ref()
-        .ok_or_else(|| "未设置根目录".to_string())?;
+        .ok_or(AppError::RootDirNotSet)
+        .map_err(|e| String::from(e))?;
 
-    fn build_tree(dir_path: &Path) -> Result<TreeNode, String> {
+    fn build_tree(dir_path: &Path) -> Result<TreeNode, AppError> {
         let name = dir_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -106,16 +116,37 @@ fn get_folder_tree(state: State<AppState>) -> Result<TreeNode, String> {
         let path = dir_path.to_string_lossy().to_string();
         let mut children = Vec::new();
 
-        if let Ok(entries) = fs::read_dir(dir_path) {
-            for entry in entries.flatten() {
-                if let Ok(file_type) = entry.file_type() {
-                    if file_type.is_dir() {
-                        if let Ok(child) = build_tree(&entry.path()) {
-                            children.push(child);
-                        }
-                    }
-                }
+        let entries = match fs::read_dir(dir_path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                log::warn!("无法读取目录 {}: {}", path, e);
+                return Ok(TreeNode {
+                    name,
+                    path,
+                    children,
+                });
             }
+        };
+
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let child = match build_tree(&entry.path()) {
+                Ok(child) => child,
+                Err(e) => {
+                    log::warn!("递归构建树失败: {}", e);
+                    continue;
+                }
+            };
+
+            children.push(child);
         }
 
         Ok(TreeNode {
@@ -125,7 +156,7 @@ fn get_folder_tree(state: State<AppState>) -> Result<TreeNode, String> {
         })
     }
 
-    build_tree(root_path)
+    build_tree(root_path).map_err(|e| String::from(e))
 }
 
 // 获取文件夹中的图片
@@ -137,32 +168,54 @@ fn get_images_in_folder(
     let root_dir = state.root_dir.lock().unwrap();
     let root_path = root_dir
         .as_ref()
-        .ok_or_else(|| "未设置根目录".to_string())?;
+        .ok_or(AppError::RootDirNotSet)
+        .map_err(|e| String::from(e))?;
 
     let folder = Path::new(&folder_path);
     if !folder.starts_with(root_path) {
-        return Err("无效的文件夹路径".to_string());
+        return Err(String::from(AppError::InvalidPath(folder_path)));
     }
 
     let mut relative_paths = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(folder) {
-        for entry in entries.flatten() {
-            if let Ok(file_type) = entry.file_type() {
-                if file_type.is_file() {
-                    let path = entry.path();
-                    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-                    // 检查是否是 .dat 文件或 Sns 缓存文件
-                    if filename.to_lowercase().ends_with(".dat") || is_valid_sns_filename(filename)
-                    {
-                        if let Ok(rel_path) = path.strip_prefix(root_path) {
-                            relative_paths.push(rel_path.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }
+    let entries = match fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("无法读取文件夹 {}: {}", folder_path, e);
+            return Ok(relative_paths);
         }
+    };
+
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let filename = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+
+        // 检查是否是 .dat 文件或 Sns 缓存文件
+        let is_dat = filename.to_lowercase().ends_with(".dat");
+        let is_sns = is_valid_sns_filename(filename);
+
+        if !is_dat && !is_sns {
+            continue;
+        }
+
+        let rel_path = match path.strip_prefix(root_path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        relative_paths.push(rel_path.to_string_lossy().to_string());
     }
 
     Ok(relative_paths)
@@ -181,12 +234,13 @@ fn decrypt_dat_file(file_path: String, state: State<AppState>) -> Result<String,
     let root_dir = state.root_dir.lock().unwrap();
     let root_path = root_dir
         .as_ref()
-        .ok_or_else(|| "未设置根目录".to_string())?;
+        .ok_or(AppError::RootDirNotSet)
+        .map_err(|e| String::from(e))?;
 
     let full_path = root_path.join(&file_path);
 
     if !full_path.exists() {
-        return Err("文件不存在".to_string());
+        return Err(String::from(AppError::FileNotFound(file_path)));
     }
 
     let xor_key = *state.xor_key.lock().unwrap();
@@ -201,7 +255,7 @@ fn decrypt_dat_file(file_path: String, state: State<AppState>) -> Result<String,
 
     // 解密文件
     let decrypted_data = DatDecryptor::decrypt(&full_path, xor_key, aes_key_option)
-        .map_err(|e| format!("解密失败: {:?}", e))?;
+        .map_err(|e| String::from(AppError::DecryptFailed(format!("{:?}", e))))?;
 
     // 转换为 base64
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&decrypted_data);
@@ -223,7 +277,7 @@ fn update_keys(xor: u8, aes: String, state: State<AppState>) -> Result<(), Strin
     *state.aes_key.lock().unwrap() = aes_key;
 
     // 保存到配置文件
-    save_key_to_config(xor, &aes)?;
+    save_key_to_config(xor, &aes).map_err(|e| String::from(e))?;
 
     Ok(())
 }

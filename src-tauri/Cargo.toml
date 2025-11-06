@@ -28,3 +28,4 @@ base64 = "0.22"
 anyhow = "1.0"
 thiserror = "2.0.17"
 log = "0.4"
+windows = { version = "0.51", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System"] }
