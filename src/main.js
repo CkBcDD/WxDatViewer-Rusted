@@ -1,12 +1,13 @@
 const { invoke } = window.__TAURI__.core;
 
 // --- 元素获取 ---
-let homeBtn, folderBtn, settingsBtn;
+let homeBtn, folderBtn, settingsBtn, layoutToggleBtn;
 let selectFolderBtn;
 let homeView, folderView, settingsView;
 let dirTree, breadcrumb, imageGallery, scrollContainer;
 let currentFolderInfo;
 let xorKeyInput, aesKeyInput, saveKeysBtn, saveStatus;
+let layoutIconWaterfall, layoutIconGrid;
 
 // --- 状态管理 ---
 let currentRootDir = null;
@@ -15,6 +16,7 @@ let currentImageIndex = 0;
 let columnElements = [];
 let sentinelObserver = null;
 let isLoading = false;
+let currentLayout = 'waterfall'; // 'waterfall' 或 'grid'
 const BATCH_SIZE = 10;
 
 // --- 工具函数 ---
@@ -35,6 +37,26 @@ function switchView(viewName) {
     homeBtn.appearance = viewName === 'home' ? 'accent' : 'stealth';
     folderBtn.appearance = viewName === 'folder' ? 'accent' : 'stealth';
     settingsBtn.appearance = viewName === 'settings' ? 'accent' : 'stealth';
+}
+
+// --- 布局切换 ---
+function toggleLayout() {
+    currentLayout = currentLayout === 'waterfall' ? 'grid' : 'waterfall';
+
+    // 更新图标显示
+    if (currentLayout === 'grid') {
+        layoutIconWaterfall.style.display = 'none';
+        layoutIconGrid.style.display = 'block';
+    } else {
+        layoutIconWaterfall.style.display = 'block';
+        layoutIconGrid.style.display = 'none';
+    }
+
+    // 重新加载当前文件夹
+    const folderPath = breadcrumb.querySelector('fluent-breadcrumb-item:last-child')?.dataset.path;
+    if (folderPath) {
+        startImageLoading(folderPath);
+    }
 }
 
 // --- 文件夹选择 ---
@@ -168,14 +190,23 @@ function setupLayout() {
     imageGallery.innerHTML = '';
     columnElements = [];
 
-    // 创建列
-    const columnCount = Math.max(2, Math.floor(imageGallery.offsetWidth / 300));
+    if (currentLayout === 'grid') {
+        // 网格布局
+        imageGallery.classList.add('grid-layout');
+        // 在网格布局中，不需要创建列，直接使用 grid
+    } else {
+        // 瀑布流布局
+        imageGallery.classList.remove('grid-layout');
 
-    for (let i = 0; i < columnCount; i++) {
-        const column = document.createElement('div');
-        column.className = 'image-column';
-        imageGallery.appendChild(column);
-        columnElements.push(column);
+        // 创建列
+        const columnCount = Math.max(2, Math.floor(imageGallery.offsetWidth / 300));
+
+        for (let i = 0; i < columnCount; i++) {
+            const column = document.createElement('div');
+            column.className = 'image-column';
+            imageGallery.appendChild(column);
+            columnElements.push(column);
+        }
     }
 
     // 设置哨兵观察器
@@ -203,11 +234,26 @@ function setupSentinel() {
 
 function loadInitialImages() {
     const viewportHeight = scrollContainer.offsetHeight;
-    const estimatedImagesNeeded = Math.ceil(viewportHeight / 200) * columnElements.length;
 
-    for (let i = 0; i < Math.min(estimatedImagesNeeded, allImagePaths.length); i++) {
-        const shortestColumn = getShortestColumn();
-        addImageToColumn(shortestColumn);
+    if (currentLayout === 'grid') {
+        // 网格布局：计算需要填充视口的图片数量
+        const itemWidth = 200; // minmax(200px, 1fr)
+        const gap = 16;
+        const columns = Math.floor(imageGallery.offsetWidth / (itemWidth + gap));
+        const rows = Math.ceil(viewportHeight / (itemWidth + gap));
+        const estimatedImagesNeeded = columns * rows * 2; // 多加载一些
+
+        for (let i = 0; i < Math.min(estimatedImagesNeeded, allImagePaths.length); i++) {
+            addImageToGallery();
+        }
+    } else {
+        // 瀑布流布局
+        const estimatedImagesNeeded = Math.ceil(viewportHeight / 200) * columnElements.length;
+
+        for (let i = 0; i < Math.min(estimatedImagesNeeded, allImagePaths.length); i++) {
+            const shortestColumn = getShortestColumn();
+            addImageToColumn(shortestColumn);
+        }
     }
 }
 
@@ -217,8 +263,12 @@ function loadMoreImages() {
     isLoading = true;
 
     for (let i = 0; i < BATCH_SIZE && currentImageIndex < allImagePaths.length; i++) {
-        const shortestColumn = getShortestColumn();
-        addImageToColumn(shortestColumn);
+        if (currentLayout === 'grid') {
+            addImageToGallery();
+        } else {
+            const shortestColumn = getShortestColumn();
+            addImageToColumn(shortestColumn);
+        }
     }
 
     isLoading = false;
@@ -228,6 +278,37 @@ function getShortestColumn() {
     return columnElements.reduce((shortest, current) =>
         current.offsetHeight < shortest.offsetHeight ? current : shortest
     );
+}
+
+function addImageToGallery() {
+    // 用于网格布局：直接添加到 gallery
+    if (currentImageIndex >= allImagePaths.length) return;
+
+    const relPath = allImagePaths[currentImageIndex++];
+    const fileName = relPath.split(/[\\/]/).pop();
+
+    const card = document.createElement('fluent-card');
+    card.className = 'image-card is-loading';
+
+    const placeholder = document.createElement('div');
+    placeholder.className = 'image-placeholder';
+    placeholder.textContent = '加载中...';
+
+    const img = document.createElement('img');
+    img.alt = fileName;
+    img.style.display = 'none';
+
+    const caption = document.createElement('div');
+    caption.className = 'caption';
+    caption.textContent = fileName;
+
+    card.appendChild(placeholder);
+    card.appendChild(img);
+    card.appendChild(caption);
+    imageGallery.appendChild(card);
+
+    // 异步加载图片
+    fetchAndSetImage(relPath, img, card, placeholder);
 }
 
 async function addImageToColumn(column) {
@@ -325,6 +406,7 @@ window.addEventListener('DOMContentLoaded', () => {
     homeBtn = document.getElementById('home-btn');
     folderBtn = document.getElementById('folder-btn');
     settingsBtn = document.getElementById('settings-btn');
+    layoutToggleBtn = document.getElementById('layout-toggle-btn');
     selectFolderBtn = document.getElementById('select-folder-btn');
     homeView = document.getElementById('home-view');
     folderView = document.getElementById('folder-view');
@@ -338,6 +420,8 @@ window.addEventListener('DOMContentLoaded', () => {
     aesKeyInput = document.getElementById('aes-key-input');
     saveKeysBtn = document.getElementById('save-keys-btn');
     saveStatus = document.getElementById('save-status');
+    layoutIconWaterfall = document.getElementById('layout-icon-waterfall');
+    layoutIconGrid = document.getElementById('layout-icon-grid');
 
     // 事件监听
     homeBtn.addEventListener('click', () => switchView('home'));
@@ -346,6 +430,7 @@ window.addEventListener('DOMContentLoaded', () => {
         else alert('请先在主页选择一个根目录！');
     });
     settingsBtn.addEventListener('click', () => switchView('settings'));
+    layoutToggleBtn.addEventListener('click', toggleLayout);
     selectFolderBtn.addEventListener('click', selectFolder);
     saveKeysBtn.addEventListener('click', saveSettings);
 
