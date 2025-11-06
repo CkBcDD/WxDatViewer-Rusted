@@ -131,6 +131,31 @@ main {
   font-size: 18px;
 }
 
+.control-bar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 12px 16px;
+  background-color: var(--neutral-layer-2);
+  border-bottom: 1px solid var(--neutral-stroke-layer-rest);
+  flex-shrink: 0;
+}
+
+.control-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.control-group label {
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.control-group fluent-select {
+  min-width: 160px;
+}
+
 .gallery-scroll-container {
   flex-grow: 1;
   overflow-y: auto;

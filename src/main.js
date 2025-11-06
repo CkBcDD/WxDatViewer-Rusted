@@ -8,15 +8,19 @@ let dirTree, breadcrumb, imageGallery, scrollContainer;
 let currentFolderInfo;
 let xorKeyInput, aesKeyInput, saveKeysBtn, saveStatus;
 let layoutIconWaterfall, layoutIconGrid;
+let sortSelect, hideThumbnailsCheckbox;
 
 // --- 状态管理 ---
 let currentRootDir = null;
 let allImagePaths = [];
+let filteredImagePaths = [];
 let currentImageIndex = 0;
 let columnElements = [];
 let sentinelObserver = null;
 let isLoading = false;
 let currentLayout = 'waterfall'; // 'waterfall' 或 'grid'
+let currentSortOrder = 'time-desc';
+let hideThumbnails = false;
 const BATCH_SIZE = 10;
 
 // --- 工具函数 ---
@@ -163,15 +167,24 @@ async function startImageLoading(folderPath) {
     try {
         // 重置状态
         allImagePaths = [];
+        filteredImagePaths = [];
         currentImageIndex = 0;
         imageGallery.innerHTML = '';
         columnElements = [];
 
-        // 获取图片列表
+        // 获取图片列表（现在返回的是 ImageInfo 对象数组）
         allImagePaths = await invoke('get_images_in_folder', { folderPath });
 
         if (allImagePaths.length === 0) {
             imageGallery.innerHTML = '<p style="text-align:center;padding:20px;">该文件夹中没有图片</p>';
+            return;
+        }
+
+        // 应用筛选和排序
+        applyFilterAndSort();
+
+        if (filteredImagePaths.length === 0) {
+            imageGallery.innerHTML = '<p style="text-align:center;padding:20px;">没有符合条件的图片</p>';
             return;
         }
 
@@ -184,6 +197,37 @@ async function startImageLoading(folderPath) {
         console.error('加载图片失败:', error);
         imageGallery.innerHTML = '<p style="text-align:center;padding:20px;color:red;">加载失败: ' + error + '</p>';
     }
+}
+
+// --- 应用筛选和排序 ---
+function applyFilterAndSort() {
+    // 筛选
+    filteredImagePaths = allImagePaths.filter(img => {
+        if (hideThumbnails && img.is_thumbnail) {
+            return false;
+        }
+        return true;
+    });
+
+    // 排序
+    filteredImagePaths.sort((a, b) => {
+        switch (currentSortOrder) {
+            case 'name-asc':
+                return a.name.localeCompare(b.name);
+            case 'name-desc':
+                return b.name.localeCompare(a.name);
+            case 'time-asc':
+                return a.modified - b.modified;
+            case 'time-desc':
+                return b.modified - a.modified;
+            case 'size-asc':
+                return a.size - b.size;
+            case 'size-desc':
+                return b.size - a.size;
+            default:
+                return 0;
+        }
+    });
 }
 
 function setupLayout() {
@@ -243,14 +287,14 @@ function loadInitialImages() {
         const rows = Math.ceil(viewportHeight / (itemWidth + gap));
         const estimatedImagesNeeded = columns * rows * 2; // 多加载一些
 
-        for (let i = 0; i < Math.min(estimatedImagesNeeded, allImagePaths.length); i++) {
+        for (let i = 0; i < Math.min(estimatedImagesNeeded, filteredImagePaths.length); i++) {
             addImageToGallery();
         }
     } else {
         // 瀑布流布局
         const estimatedImagesNeeded = Math.ceil(viewportHeight / 200) * columnElements.length;
 
-        for (let i = 0; i < Math.min(estimatedImagesNeeded, allImagePaths.length); i++) {
+        for (let i = 0; i < Math.min(estimatedImagesNeeded, filteredImagePaths.length); i++) {
             const shortestColumn = getShortestColumn();
             addImageToColumn(shortestColumn);
         }
@@ -258,11 +302,11 @@ function loadInitialImages() {
 }
 
 function loadMoreImages() {
-    if (isLoading || currentImageIndex >= allImagePaths.length) return;
+    if (isLoading || currentImageIndex >= filteredImagePaths.length) return;
 
     isLoading = true;
 
-    for (let i = 0; i < BATCH_SIZE && currentImageIndex < allImagePaths.length; i++) {
+    for (let i = 0; i < BATCH_SIZE && currentImageIndex < filteredImagePaths.length; i++) {
         if (currentLayout === 'grid') {
             addImageToGallery();
         } else {
@@ -282,10 +326,11 @@ function getShortestColumn() {
 
 function addImageToGallery() {
     // 用于网格布局：直接添加到 gallery
-    if (currentImageIndex >= allImagePaths.length) return;
+    if (currentImageIndex >= filteredImagePaths.length) return;
 
-    const relPath = allImagePaths[currentImageIndex++];
-    const fileName = relPath.split(/[\\/]/).pop();
+    const imageInfo = filteredImagePaths[currentImageIndex++];
+    const relPath = imageInfo.path;
+    const fileName = imageInfo.name;
 
     const card = document.createElement('fluent-card');
     card.className = 'image-card is-loading';
@@ -312,10 +357,11 @@ function addImageToGallery() {
 }
 
 async function addImageToColumn(column) {
-    if (currentImageIndex >= allImagePaths.length) return;
+    if (currentImageIndex >= filteredImagePaths.length) return;
 
-    const relPath = allImagePaths[currentImageIndex++];
-    const fileName = relPath.split(/[\\/]/).pop();
+    const imageInfo = filteredImagePaths[currentImageIndex++];
+    const relPath = imageInfo.path;
+    const fileName = imageInfo.name;
 
     const card = document.createElement('fluent-card');
     card.className = 'image-card is-loading';
@@ -422,6 +468,8 @@ window.addEventListener('DOMContentLoaded', () => {
     saveStatus = document.getElementById('save-status');
     layoutIconWaterfall = document.getElementById('layout-icon-waterfall');
     layoutIconGrid = document.getElementById('layout-icon-grid');
+    sortSelect = document.getElementById('sort-select');
+    hideThumbnailsCheckbox = document.getElementById('hide-thumbnails-checkbox');
 
     // 事件监听
     homeBtn.addEventListener('click', () => switchView('home'));
@@ -433,6 +481,23 @@ window.addEventListener('DOMContentLoaded', () => {
     layoutToggleBtn.addEventListener('click', toggleLayout);
     selectFolderBtn.addEventListener('click', selectFolder);
     saveKeysBtn.addEventListener('click', saveSettings);
+
+    // 排序和筛选事件
+    sortSelect.addEventListener('change', (e) => {
+        currentSortOrder = e.target.value;
+        const folderPath = breadcrumb.querySelector('fluent-breadcrumb-item:last-child')?.dataset.path;
+        if (folderPath) {
+            startImageLoading(folderPath);
+        }
+    });
+
+    hideThumbnailsCheckbox.addEventListener('change', (e) => {
+        hideThumbnails = e.target.checked;
+        const folderPath = breadcrumb.querySelector('fluent-breadcrumb-item:last-child')?.dataset.path;
+        if (folderPath) {
+            startImageLoading(folderPath);
+        }
+    });
 
     dirTree.addEventListener('click', (e) => {
         const clickedItem = e.target.closest('fluent-tree-item');
@@ -447,7 +512,7 @@ window.addEventListener('DOMContentLoaded', () => {
     });
 
     window.addEventListener('resize', debounce(() => {
-        if (allImagePaths.length > 0 && !folderView.classList.contains('hidden')) {
+        if (filteredImagePaths.length > 0 && !folderView.classList.contains('hidden')) {
             const folderPath = breadcrumb.querySelector('fluent-breadcrumb-item:last-child')?.dataset.path;
             if (folderPath) startImageLoading(folderPath);
         }

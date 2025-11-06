@@ -83,6 +83,22 @@
                         <div id="breadcrumb-container">
                             <fluent-breadcrumb id="breadcrumb"></fluent-breadcrumb>
                         </div>
+                        <div class="control-bar">
+                            <div class="control-group">
+                                <label for="sort-select">排序方式:</label>
+                                <fluent-select id="sort-select">
+                                    <fluent-option value="name-asc">文件名 (A-Z)</fluent-option>
+                                    <fluent-option value="name-desc">文件名 (Z-A)</fluent-option>
+                                    <fluent-option value="time-desc" selected>修改时间 (新到旧)</fluent-option>
+                                    <fluent-option value="time-asc">修改时间 (旧到新)</fluent-option>
+                                    <fluent-option value="size-desc">文件大小 (大到小)</fluent-option>
+                                    <fluent-option value="size-asc">文件大小 (小到大)</fluent-option>
+                                </fluent-select>
+                            </div>
+                            <div class="control-group">
+                                <fluent-checkbox id="hide-thumbnails-checkbox">隐藏缩略图</fluent-checkbox>
+                            </div>
+                        </div>
                         <div class="gallery-scroll-container">
                             <div id="image-gallery"></div>
                         </div>

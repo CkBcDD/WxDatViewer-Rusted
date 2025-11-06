@@ -40,6 +40,16 @@ struct TreeNode {
     children: Vec<TreeNode>,
 }
 
+// 图片文件信息
+#[derive(Serialize)]
+struct ImageInfo {
+    path: String,
+    name: String,
+    size: u64,
+    modified: u64,
+    is_thumbnail: bool,
+}
+
 // 读取配置文件
 fn read_key_from_config() -> (u8, Vec<u8>) {
     if let Ok(content) = fs::read_to_string(CONFIG_FILE) {
@@ -164,7 +174,7 @@ fn get_folder_tree(state: State<AppState>) -> Result<TreeNode, String> {
 fn get_images_in_folder(
     folder_path: String,
     state: State<AppState>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ImageInfo>, String> {
     let root_dir = state.root_dir.lock().unwrap();
     let root_path = root_dir
         .as_ref()
@@ -176,13 +186,13 @@ fn get_images_in_folder(
         return Err(String::from(AppError::InvalidPath(folder_path)));
     }
 
-    let mut relative_paths = Vec::new();
+    let mut images = Vec::new();
 
     let entries = match fs::read_dir(folder) {
         Ok(entries) => entries,
         Err(e) => {
             log::warn!("无法读取文件夹 {}: {}", folder_path, e);
-            return Ok(relative_paths);
+            return Ok(images);
         }
     };
 
@@ -210,15 +220,38 @@ fn get_images_in_folder(
             continue;
         }
 
+        // 检查是否是缩略图
+        let is_thumbnail = filename.to_lowercase().ends_with("_t.dat") || filename.ends_with("_t");
+
         let rel_path = match path.strip_prefix(root_path) {
             Ok(p) => p,
             Err(_) => continue,
         };
 
-        relative_paths.push(rel_path.to_string_lossy().to_string());
+        // 获取文件元数据
+        let metadata = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let size = metadata.len();
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        images.push(ImageInfo {
+            path: rel_path.to_string_lossy().to_string(),
+            name: filename.to_string(),
+            size,
+            modified,
+            is_thumbnail,
+        });
     }
 
-    Ok(relative_paths)
+    Ok(images)
 }
 
 // 检查是否是有效的 Sns 文件名
