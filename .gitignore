@@ -28,3 +28,6 @@ dist-ssr
 
 # VS Code extension settings
 .vscode
+
+# Config files
+config.json
