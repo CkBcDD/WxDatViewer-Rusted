@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::State;
+use tokio::sync::Semaphore;
 
 mod error;
 pub use error::{AppError, ErrorResponse};
@@ -19,13 +20,38 @@ pub mod dll;
 const CONFIG_FILE: &str = "config.json";
 
 // 全局状态
-#[derive(Default)]
 pub struct AppState {
     root_dir: Mutex<Option<PathBuf>>,
     xor_key: Mutex<u8>,
     aes_key: Mutex<Vec<u8>>,
-    // 图片缓存：存储解密后的图片数据
-    image_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    // 图片缓存：存储解密后的图片数据以及 MIME 类型
+    image_cache: Arc<Mutex<HashMap<String, CachedImage>>>,
+    // 限制同时进行的解密任务数量，避免阻塞
+    decrypt_semaphore: Arc<Semaphore>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            root_dir: Mutex::new(None),
+            xor_key: Mutex::new(0),
+            aes_key: Mutex::new(Vec::new()),
+            image_cache: Arc::new(Mutex::new(HashMap::new())),
+            decrypt_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DECRYPT)),
+        }
+    }
+}
+
+// 解密任务并发限制
+const MAX_CONCURRENT_DECRYPT: usize = 4;
+// 预取任务数量限制
+const PREFETCH_LIMIT: usize = 4;
+
+// 图片缓存实体
+#[derive(Clone)]
+struct CachedImage {
+    data: Vec<u8>,
+    mime_type: String,
 }
 
 // 配置结构
@@ -71,9 +97,15 @@ struct ImageWithData {
     size: u64,
     modified: u64,
     is_thumbnail: bool,
-    mime_type: String,
+    mime_type: Option<String>,
     // 用于前端获取图片的唯一标识符
     image_id: String,
+}
+
+#[derive(Serialize)]
+struct ImageDataResponse {
+    data: Vec<u8>,
+    mime_type: String,
 }
 
 // 读取配置文件
@@ -128,6 +160,7 @@ async fn open_folder_dialog(
 
         // 更新状态
         *state.root_dir.lock().unwrap() = Some(path_buf.to_path_buf());
+        state.image_cache.lock().unwrap().clear();
 
         // 读取配置文件中的密钥
         let (xor, aes) = read_key_from_config();
@@ -404,7 +437,6 @@ async fn get_images_batch(
     // 分页
     let page_images: Vec<ImageInfo> = images.into_iter().skip(start).take(page_size).collect();
 
-    // 批量解密
     let xor_key = *state.xor_key.lock().unwrap();
     let aes_key = state.aes_key.lock().unwrap().clone();
     let aes_key_option = if aes_key.len() == 16 {
@@ -412,55 +444,79 @@ async fn get_images_batch(
     } else {
         None
     };
-
-    // 使用 tokio 并发解密并缓存
-    let mut tasks = Vec::new();
     let cache = state.image_cache.clone();
+    let semaphore = state.decrypt_semaphore.clone();
 
-    for img_info in page_images {
-        let root_path_clone = root_path.clone();
-        let xor_key_clone = xor_key;
-        let aes_key_clone = aes_key_option.clone();
-        let cache_clone = cache.clone();
+    let mut images_with_data = Vec::with_capacity(page_images.len());
 
-        let task = tokio::task::spawn_blocking(move || {
-            let full_path = root_path_clone.join(&img_info.path);
+    for (index, img_info) in page_images.into_iter().enumerate() {
+        let image_id = img_info.path.clone();
+        let cached_mime = {
+            let cache_map = cache.lock().unwrap();
+            cache_map
+                .get(&image_id)
+                .map(|entry| entry.mime_type.clone())
+        };
 
-            let decrypted_data =
-                match DatDecryptor::decrypt(&full_path, xor_key_clone, aes_key_clone.as_deref()) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        log::warn!("解密失败 {}: {:?}", img_info.path, e);
-                        return Err(format!("解密失败: {:?}", e));
-                    }
-                };
-
-            let (normalized_data, mime_type) = normalize_decrypted_image(decrypted_data);
-            let image_id = img_info.path.clone();
-
-            let mut cache_map = cache_clone.lock().unwrap();
-            cache_map.insert(image_id.clone(), normalized_data);
-
-            Ok(ImageWithData {
-                path: img_info.path,
-                name: img_info.name,
-                size: img_info.size,
-                modified: img_info.modified,
-                is_thumbnail: img_info.is_thumbnail,
-                image_id,
-                mime_type,
-            })
+        images_with_data.push(ImageWithData {
+            path: img_info.path.clone(),
+            name: img_info.name.clone(),
+            size: img_info.size,
+            modified: img_info.modified,
+            is_thumbnail: img_info.is_thumbnail,
+            image_id: image_id.clone(),
+            mime_type: cached_mime.clone(),
         });
 
-        tasks.push(task);
-    }
-
-    // 等待所有任务完成
-    let mut images_with_data = Vec::new();
-    for task in tasks {
-        if let Ok(Ok(img)) = task.await {
-            images_with_data.push(img);
+        if index >= PREFETCH_LIMIT || cached_mime.is_some() {
+            continue;
         }
+
+        let root_path_clone = root_path.clone();
+        let cache_clone = cache.clone();
+        let semaphore_clone = semaphore.clone();
+        let aes_key_clone = aes_key_option.clone();
+        let image_info_clone = img_info.clone();
+        let xor_key_clone = xor_key;
+
+        tokio::spawn(async move {
+            let full_path = root_path_clone.join(&image_info_clone.path);
+
+            let permit = match semaphore_clone.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(err) => {
+                    log::warn!("获取解密许可失败 {}: {}", image_info_clone.path, err);
+                    return;
+                }
+            };
+
+            let decrypt_result = tokio::task::spawn_blocking(move || {
+                DatDecryptor::decrypt(&full_path, xor_key_clone, aes_key_clone.as_deref())
+                    .map(|data| normalize_decrypted_image(data))
+            })
+            .await;
+
+            drop(permit);
+
+            match decrypt_result {
+                Ok(Ok((normalized_data, mime_type))) => {
+                    let mut cache_map = cache_clone.lock().unwrap();
+                    cache_map.insert(
+                        image_info_clone.path.clone(),
+                        CachedImage {
+                            data: normalized_data,
+                            mime_type,
+                        },
+                    );
+                }
+                Ok(Err(err)) => {
+                    log::warn!("解密失败 {}: {:?}", image_info_clone.path, err);
+                }
+                Err(err) => {
+                    log::warn!("解密任务执行失败 {}: {}", image_info_clone.path, err);
+                }
+            }
+        });
     }
 
     Ok(ImageBatch {
@@ -638,13 +694,80 @@ fn decrypt_dat_file(file_path: String, state: State<AppState>) -> Result<String,
 
 // 获取缓存中的图片数据
 #[tauri::command]
-fn get_image_data(image_id: String, state: State<AppState>) -> Result<Vec<u8>, String> {
-    let cache = state.image_cache.lock().unwrap();
+async fn get_image_data(
+    image_id: String,
+    state: State<'_, AppState>,
+) -> Result<ImageDataResponse, String> {
+    {
+        let cache = state.image_cache.lock().unwrap();
+        if let Some(cached) = cache.get(&image_id) {
+            return Ok(ImageDataResponse {
+                data: cached.data.clone(),
+                mime_type: cached.mime_type.clone(),
+            });
+        }
+    }
 
-    cache
-        .get(&image_id)
-        .cloned()
-        .ok_or_else(|| format!("图片不在缓存中: {}", image_id))
+    let root_path = {
+        let guard = state.root_dir.lock().unwrap();
+        guard
+            .as_ref()
+            .ok_or(AppError::RootDirNotSet)
+            .map_err(|e| String::from(e))?
+            .clone()
+    };
+
+    let full_path = root_path.join(&image_id);
+
+    if !full_path.exists() {
+        return Err(String::from(AppError::FileNotFound(image_id)));
+    }
+
+    let xor_key = *state.xor_key.lock().unwrap();
+    let aes_key_vec = state.aes_key.lock().unwrap().clone();
+    let aes_key_option = if aes_key_vec.len() == 16 {
+        Some(aes_key_vec)
+    } else {
+        None
+    };
+
+    let cache = state.image_cache.clone();
+    let semaphore = state.decrypt_semaphore.clone();
+    let image_id_clone = image_id.clone();
+    let xor_key_clone = xor_key;
+    let aes_key_clone = aes_key_option.clone();
+
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|err| format!("获取解密许可失败: {}", err))?;
+
+    let decrypt_result = tokio::task::spawn_blocking(move || {
+        let aes_key_ref = aes_key_clone.as_deref();
+        DatDecryptor::decrypt(&full_path, xor_key_clone, aes_key_ref)
+            .map(|data| normalize_decrypted_image(data))
+    })
+    .await
+    .map_err(|err| format!("解密任务执行失败: {}", err))?;
+
+    drop(permit);
+
+    let (normalized_data, mime_type) =
+        decrypt_result.map_err(|err| format!("解密失败: {:?}", err))?;
+
+    let mut cache_map = cache.lock().unwrap();
+    cache_map.insert(
+        image_id_clone,
+        CachedImage {
+            data: normalized_data.clone(),
+            mime_type: mime_type.clone(),
+        },
+    );
+
+    Ok(ImageDataResponse {
+        data: normalized_data,
+        mime_type,
+    })
 }
 
 // 清除图片缓存（可选，用于释放内存）
@@ -670,6 +793,9 @@ fn update_keys(xor: u8, aes: String, state: State<AppState>) -> Result<(), Strin
 
     // 保存到配置文件
     save_key_to_config(xor, &aes).map_err(|e| String::from(e))?;
+
+    // 更新密钥后清理缓存，避免旧密钥解密的数据残留
+    state.image_cache.lock().unwrap().clear();
 
     Ok(())
 }

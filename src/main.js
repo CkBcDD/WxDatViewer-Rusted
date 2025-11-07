@@ -222,9 +222,11 @@ async function loadImageBlob(imageId, mimeType = 'image/jpeg') {
     try {
         // 从后端获取图片二进制数据
         const imageData = await invoke('get_image_data', { imageId });
+        const bytes = imageData?.data ?? [];
+        const resolvedMime = imageData?.mime_type || mimeType || 'image/jpeg';
 
         // 创建 Blob 和 URL
-        const blob = new Blob([new Uint8Array(imageData)], { type: mimeType || 'image/jpeg' });
+        const blob = new Blob([new Uint8Array(bytes)], { type: resolvedMime });
         const blobUrl = URL.createObjectURL(blob);
 
         // 缓存 URL
